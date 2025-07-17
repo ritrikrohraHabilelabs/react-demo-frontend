@@ -1,0 +1,126 @@
+# Azure Pipeline for React App Deployment
+
+trigger:
+  branches:
+    include:
+      - master
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  # These variables will be set by Terraform
+  - name: BACKEND_URL
+    value: $(BACKEND_URL)
+  - name: SENTRY_AUTH_TOKEN
+    value: $(SENTRY_AUTH_TOKEN)
+  - name: ENVIRONMENT
+    value: $(ENVIRONMENT)
+  - name: STORAGE_ACCOUNT_NAME
+    value: $(STORAGE_ACCOUNT_NAME)
+  - name: RESOURCE_GROUP_NAME
+    value: $(RESOURCE_GROUP_NAME)
+
+stages:
+  - stage: Build
+    displayName: 'Build Stage'
+    jobs:
+      - job: Build
+        displayName: 'Build Job'
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '18.x'
+            displayName: 'Install Node.js'
+
+          - script: |
+              npm install
+            displayName: 'Install dependencies'
+
+          - script: |
+              export REACT_APP_BACKEND_URL=$(BACKEND_URL)
+              export REACT_APP_SENTRY_AUTH_TOKEN=$(SENTRY_AUTH_TOKEN)
+              export REACT_APP_ENVIRONMENT=$(ENVIRONMENT)
+              npm run build
+            displayName: 'Build application'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathtoPublish: 'build'
+              artifactName: 'build-output'
+            displayName: 'Publish build artifacts'
+
+  - stage: Deploy
+    displayName: 'Deploy Stage'
+    dependsOn: Build
+    jobs:
+      - deployment: Deploy
+        displayName: 'Deploy Job'
+        environment: $(ENVIRONMENT)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@1
+                  inputs:
+                    buildType: 'current'
+                    downloadType: 'single'
+                    artifactName: 'build-output'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+                  displayName: 'Download build artifacts'
+
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: 'Azure Service Connection'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      # Enable static website hosting
+                      az storage blob service-properties update \
+                        --account-name $(STORAGE_ACCOUNT_NAME) \
+                        --static-website \
+                        --404-document index.html \
+                        --index-document index.html
+
+                      # Upload files to $web container
+                      az storage blob upload-batch \
+                        --account-name $(STORAGE_ACCOUNT_NAME) \
+                        --destination '$web' \
+                        --source '$(System.ArtifactsDirectory)/build-output' \
+                        --overwrite true
+
+                      # Purge CDN cache
+                      az cdn endpoint purge \
+                        --resource-group $(RESOURCE_GROUP_NAME) \
+                        --name endpoint-$(Build.Repository.Name)-$(Build.BuildId) \
+                        --profile-name cdn-$(Build.Repository.Name)-$(Build.BuildId) \
+                        --content-paths "/*"
+                  displayName: 'Deploy to Azure Storage and purge CDN'
+
+  - stage: Test
+    displayName: 'Test Stage'
+    dependsOn: Deploy
+    jobs:
+      - job: Test
+        displayName: 'Test Job'
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: 'Azure Service Connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Get CDN endpoint URL
+                CDN_URL=$(az cdn endpoint show \
+                  --resource-group $(RESOURCE_GROUP_NAME) \
+                  --name endpoint-$(Build.Repository.Name)-$(Build.BuildId) \
+                  --profile-name cdn-$(Build.Repository.Name)-$(Build.BuildId) \
+                  --query "hostName" -o tsv)
+                
+                # Test website availability
+                echo "Testing website at: https://$CDN_URL"
+                curl -f "https://$CDN_URL" || exit 1
+                
+                echo "Website deployment successful!"
+            displayName: 'Test website availability'
